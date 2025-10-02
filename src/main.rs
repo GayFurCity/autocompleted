@@ -38,7 +38,7 @@ mod models {
     #[derive(Deserialize, PostgresMapper, Serialize)]
     #[pg_mapper(table = "tags")] // singular 'user' is a keyword..
     pub struct Tag {
-        pub id: i32,
+        pub id: i64,
         pub name: String,
         pub post_count: i32,
         pub category: i16,
