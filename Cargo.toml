@@ -7,6 +7,8 @@ edition = "2021"
 
 [dependencies]
 actix-web = "4"
+actix-web-prom = { version = "0.9", features = ["process"] }
+prometheus = { version = "0.13", default-features = false }
 moka = { version = "0.12.1", features = ["future"] }
 config = { version = "0.13.3", default_features = false }
 deadpool-postgres = { version = "0.12.0", features = ["serde", "rt_tokio_1"] }
@@ -16,6 +18,7 @@ serde_json = "1.0"
 tokio-pg-mapper = "0.2"
 tokio-pg-mapper-derive = "0.2"
 tokio-postgres = "0.7.8"
+tokio = { version = "1", features = ["macros"] }
 unicode-normalization = "0.1.19"
 log = "0.4"
 env_logger = "0.11.0"

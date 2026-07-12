@@ -8,6 +8,7 @@ services:
     build: .
     environment:
       SERVER_ADDR: ${SERVER_ADDR}
+      METRICS_ADDR: ${METRICS_ADDR:-0.0.0.0:9396}
       PG__USER: ${PG__USER}
       PG__PASSWORD: ${PG__PASSWORD}
       PG__HOST: ${PG__HOST}

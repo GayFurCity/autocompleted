@@ -6,11 +6,14 @@ use actix_web::{
     web::{self, Data},
     HttpResponse, HttpResponseBuilder,
 };
+use actix_web_prom::PrometheusMetricsBuilder;
 use deadpool_postgres::{Pool, Runtime};
 use derive_more::{Display, Error, From};
 use log::error;
 use moka::future::Cache;
+use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, Registry, TextEncoder};
 use serde::Deserialize;
+use std::time::Instant;
 
 mod config {
     use serde::Deserialize;
@@ -18,12 +21,14 @@ mod config {
     #[derive(Deserialize)]
     pub struct Config {
         pub server_addr: String,
+        pub metrics_addr: String,
         pub pg: deadpool_postgres::Config,
     }
 
     impl Config {
         pub fn from_env() -> Result<Self, config::ConfigError> {
             config::Config::builder()
+                .set_default("metrics_addr", "0.0.0.0:9396")?
                 .add_source(config::Environment::default().separator("__"))
                 .build()?
                 .try_deserialize()
@@ -94,6 +99,9 @@ mod db {
 struct AutocompleteState {
     pool: Pool,
     cache: Cache<String, String>,
+    cache_hits: IntCounter,
+    cache_misses: IntCounter,
+    db_query_duration: Histogram,
 }
 
 #[derive(Debug, Display, Error, From)]
@@ -159,11 +167,13 @@ async fn autocomplete(
     let prefix: String = validate_transform_tag(req.tag_prefix.as_str())?;
     let cached = data.cache.get(&prefix).await;
     return if let Some(cached_json) = cached {
+        data.cache_hits.inc();
         Ok(HttpResponse::Ok()
             .insert_header((header::CONTENT_TYPE, "application/json; charset=utf-8"))
             .insert_header((header::CACHE_CONTROL, "public, max-age=604800"))
             .body(cached_json))
     } else {
+        data.cache_misses.inc();
         let client = match data.pool.get().await {
             Ok(x) => x,
             Err(x) => {
@@ -171,13 +181,16 @@ async fn autocomplete(
                 return Err(AutocompleteError::ServerError);
             }
         };
+        let query_start = Instant::now();
         let results = match db::get_tags(&client, &prefix).await {
             Ok(x) => x,
             Err(x) => {
+                data.db_query_duration.observe(query_start.elapsed().as_secs_f64());
                 error!("{}", x.to_string());
                 return Err(AutocompleteError::ServerError);
             }
         };
+        data.db_query_duration.observe(query_start.elapsed().as_secs_f64());
         let serialized = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
         let serialized_copy = serialized.clone();
         data.cache.insert(prefix, serialized).await;
@@ -191,6 +204,17 @@ async fn autocomplete(
 #[get("/up")]
 async fn healthcheck() -> HttpResponse {
     HttpResponse::NoContent().finish()
+}
+
+async fn metrics(registry: web::Data<Registry>) -> HttpResponse {
+    let encoder = TextEncoder::new();
+    let mut buffer = Vec::new();
+    encoder
+        .encode(&registry.gather(), &mut buffer)
+        .unwrap_or_default();
+    HttpResponse::Ok()
+        .content_type(encoder.format_type())
+        .body(buffer)
 }
 
 #[actix_web::main]
@@ -207,21 +231,64 @@ async fn main() -> std::io::Result<()> {
         .time_to_live(Duration::from_secs(6 * 60 * 60))
         .build();
 
-    HttpServer::new(move || {
+    // http_requests_total / http_requests_duration_seconds instrumentation, wrapped around
+    // the public app below. Not served on the public port: /metrics is only exposed on
+    // metrics_addr, an internal port not reachable through the reverse-proxied domain.
+    let http_metrics = PrometheusMetricsBuilder::new("autocompleted")
+        .build()
+        .unwrap();
+    let registry = http_metrics.registry.clone();
+
+    let cache_hits = IntCounter::new(
+        "autocompleted_cache_hits_total",
+        "Number of autocomplete requests served from the in-memory cache",
+    )
+    .unwrap();
+    let cache_misses = IntCounter::new(
+        "autocompleted_cache_misses_total",
+        "Number of autocomplete requests that required a database query",
+    )
+    .unwrap();
+    let db_query_duration = Histogram::with_opts(HistogramOpts::new(
+        "autocompleted_db_query_duration_seconds",
+        "Duration of tag lookup queries against postgres",
+    ))
+    .unwrap();
+    registry.register(Box::new(cache_hits.clone())).unwrap();
+    registry.register(Box::new(cache_misses.clone())).unwrap();
+    registry
+        .register(Box::new(db_query_duration.clone()))
+        .unwrap();
+
+    let app_server = HttpServer::new(move || {
         App::new()
             .wrap(
                 DefaultHeaders::new()
                     .add((header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"))
                     .add((header::ACCESS_CONTROL_ALLOW_HEADERS, "Authorization")),
             )
+            .wrap(http_metrics.clone())
             .app_data(Data::new(AutocompleteState {
                 pool: pool.clone(),
                 cache: cache.clone(),
+                cache_hits: cache_hits.clone(),
+                cache_misses: cache_misses.clone(),
+                db_query_duration: db_query_duration.clone(),
             }))
             .service(autocomplete)
             .service(healthcheck)
     })
     .bind(config.server_addr.clone())?
-    .run()
-    .await
+    .run();
+
+    let metrics_server = HttpServer::new(move || {
+        App::new()
+            .app_data(Data::new(registry.clone()))
+            .route("/metrics", web::get().to(metrics))
+    })
+    .bind(config.metrics_addr.clone())?
+    .run();
+
+    tokio::try_join!(app_server, metrics_server)?;
+    Ok(())
 }
