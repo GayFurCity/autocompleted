@@ -4,9 +4,17 @@ WORKDIR /app
 
 RUN apk add --no-cache musl-dev
 
+# Build dependencies in their own layer, keyed only on the manifest files, so
+# unrelated source changes don't bust the cache and force a full recompile of
+# every dependency on each build.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+RUN cargo build --release
+RUN rm -rf src
+
 COPY . .
 
-RUN cargo build --release
+RUN touch src/main.rs && cargo build --release
 
 FROM alpine:3.19
 
