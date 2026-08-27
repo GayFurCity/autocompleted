@@ -217,6 +217,24 @@ async fn metrics(registry: web::Data<Registry>) -> HttpResponse {
         .body(buffer)
 }
 
+// An explicit METRICS_ENABLED (any non-empty value) always wins. Otherwise fall back to whether
+// COMPOSE_PROFILES (forwarded through from docker-compose.yml, a comma-separated profile list -
+// not a plain boolean) contains "metrics".
+fn metrics_enabled() -> bool {
+    if let Ok(explicit) = std::env::var("METRICS_ENABLED") {
+        if !explicit.is_empty() {
+            return matches!(
+                explicit.to_lowercase().as_str(),
+                "true" | "t" | "yes" | "y" | "on" | "1"
+            );
+        }
+    }
+    std::env::var("COMPOSE_PROFILES")
+        .unwrap_or_default()
+        .split(',')
+        .any(|profile| profile == "metrics")
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     use actix_web::{App, HttpServer};
@@ -281,14 +299,18 @@ async fn main() -> std::io::Result<()> {
     .bind(config.server_addr.clone())?
     .run();
 
-    let metrics_server = HttpServer::new(move || {
-        App::new()
-            .app_data(Data::new(registry.clone()))
-            .route("/metrics", web::get().to(metrics))
-    })
-    .bind(config.metrics_addr.clone())?
-    .run();
+    if metrics_enabled() {
+        let metrics_server = HttpServer::new(move || {
+            App::new()
+                .app_data(Data::new(registry.clone()))
+                .route("/metrics", web::get().to(metrics))
+        })
+        .bind(config.metrics_addr.clone())?
+        .run();
 
-    tokio::try_join!(app_server, metrics_server)?;
+        tokio::try_join!(app_server, metrics_server)?;
+    } else {
+        app_server.await?;
+    }
     Ok(())
 }
