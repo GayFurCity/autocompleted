@@ -99,9 +99,9 @@ mod db {
 struct AutocompleteState {
     pool: Pool,
     cache: Cache<String, String>,
-    cache_hits: IntCounter,
-    cache_misses: IntCounter,
-    db_query_duration: Histogram,
+    cache_hits: Option<IntCounter>,
+    cache_misses: Option<IntCounter>,
+    db_query_duration: Option<Histogram>,
 }
 
 #[derive(Debug, Display, Error, From)]
@@ -167,13 +167,17 @@ async fn autocomplete(
     let prefix: String = validate_transform_tag(req.tag_prefix.as_str())?;
     let cached = data.cache.get(&prefix).await;
     return if let Some(cached_json) = cached {
-        data.cache_hits.inc();
+        if let Some(counter) = &data.cache_hits {
+            counter.inc();
+        }
         Ok(HttpResponse::Ok()
             .insert_header((header::CONTENT_TYPE, "application/json; charset=utf-8"))
             .insert_header((header::CACHE_CONTROL, "public, max-age=604800"))
             .body(cached_json))
     } else {
-        data.cache_misses.inc();
+        if let Some(counter) = &data.cache_misses {
+            counter.inc();
+        }
         let client = match data.pool.get().await {
             Ok(x) => x,
             Err(x) => {
@@ -185,12 +189,16 @@ async fn autocomplete(
         let results = match db::get_tags(&client, &prefix).await {
             Ok(x) => x,
             Err(x) => {
-                data.db_query_duration.observe(query_start.elapsed().as_secs_f64());
+                if let Some(histogram) = &data.db_query_duration {
+                    histogram.observe(query_start.elapsed().as_secs_f64());
+                }
                 error!("{}", x.to_string());
                 return Err(AutocompleteError::ServerError);
             }
         };
-        data.db_query_duration.observe(query_start.elapsed().as_secs_f64());
+        if let Some(histogram) = &data.db_query_duration {
+            histogram.observe(query_start.elapsed().as_secs_f64());
+        }
         let serialized = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
         let serialized_copy = serialized.clone();
         data.cache.insert(prefix, serialized).await;
@@ -249,6 +257,33 @@ async fn main() -> std::io::Result<()> {
         .time_to_live(Duration::from_secs(6 * 60 * 60))
         .build();
 
+    // Nothing here gets collected at all when metrics are disabled, not just left unexposed - no
+    // registry, no counters, and http_metrics (the per-request timing middleware) is never
+    // constructed or wrapped in, so there's no per-request instrumentation work either.
+    if !metrics_enabled() {
+        let app_server = HttpServer::new(move || {
+            App::new()
+                .wrap(
+                    DefaultHeaders::new()
+                        .add((header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"))
+                        .add((header::ACCESS_CONTROL_ALLOW_HEADERS, "Authorization")),
+                )
+                .app_data(Data::new(AutocompleteState {
+                    pool: pool.clone(),
+                    cache: cache.clone(),
+                    cache_hits: None,
+                    cache_misses: None,
+                    db_query_duration: None,
+                }))
+                .service(autocomplete)
+                .service(healthcheck)
+        })
+        .bind(config.server_addr.clone())?
+        .run();
+
+        return app_server.await;
+    }
+
     // http_requests_total / http_requests_duration_seconds instrumentation, wrapped around
     // the public app below. Not served on the public port: /metrics is only exposed on
     // metrics_addr, an internal port not reachable through the reverse-proxied domain.
@@ -289,9 +324,9 @@ async fn main() -> std::io::Result<()> {
             .app_data(Data::new(AutocompleteState {
                 pool: pool.clone(),
                 cache: cache.clone(),
-                cache_hits: cache_hits.clone(),
-                cache_misses: cache_misses.clone(),
-                db_query_duration: db_query_duration.clone(),
+                cache_hits: Some(cache_hits.clone()),
+                cache_misses: Some(cache_misses.clone()),
+                db_query_duration: Some(db_query_duration.clone()),
             }))
             .service(autocomplete)
             .service(healthcheck)
@@ -299,18 +334,14 @@ async fn main() -> std::io::Result<()> {
     .bind(config.server_addr.clone())?
     .run();
 
-    if metrics_enabled() {
-        let metrics_server = HttpServer::new(move || {
-            App::new()
-                .app_data(Data::new(registry.clone()))
-                .route("/metrics", web::get().to(metrics))
-        })
-        .bind(config.metrics_addr.clone())?
-        .run();
+    let metrics_server = HttpServer::new(move || {
+        App::new()
+            .app_data(Data::new(registry.clone()))
+            .route("/metrics", web::get().to(metrics))
+    })
+    .bind(config.metrics_addr.clone())?
+    .run();
 
-        tokio::try_join!(app_server, metrics_server)?;
-    } else {
-        app_server.await?;
-    }
+    tokio::try_join!(app_server, metrics_server)?;
     Ok(())
 }
